@@ -58,6 +58,7 @@ def generate_neural_gaussians(viewpoint_camera, pc : GaussianModel,
 
     # opacity mask generation
     neural_opacity = neural_opacity.reshape([-1, 1])
+    # 用来做透明度剔除
     mask = (neural_opacity>0.0)
     mask = mask.view(-1)
 
@@ -92,6 +93,8 @@ def generate_neural_gaussians(viewpoint_camera, pc : GaussianModel,
         concatenated_all = torch.cat([concatenated_repeated, color, scale_rot, offsets], dim=-1)
     if pc.enable_idiv: # Concatenate IDIV
         concatenated_all = torch.cat([concatenated_all, idiv], dim=-1)
+
+    # 统一做透明度剔除
     masked = concatenated_all[mask]
     opacity = neural_opacity[mask]
 

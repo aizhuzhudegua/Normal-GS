@@ -42,10 +42,11 @@ import uuid
 from tqdm import tqdm
 from utils.image_utils import psnr
 from argparse import ArgumentParser, Namespace
-from arguments import ModelParams, PipelineParams, OptimizationParams
+from arguments import ModelParams, PipelineParams, OptimizationParams,TensoSDFOptimParams
 from utils.graphics_utils import normalize_rendered_by_weights, render_normal_from_depth
 from utils.image_utils import linear_to_srgb
 import torch.nn.functional as F
+from fields.shape_renders import SDF_RENDER_DICT
 
 # torch.set_num_threads(32)
 lpips_fn = lpips.LPIPS(net='vgg').to('cuda')
@@ -82,7 +83,7 @@ def saveRuntimeCode(dst: str) -> None:
     print('Backup Finished!')
 
 
-def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from, wandb=None, logger=None, ply_path=None):
+def training(dataset, opt, pipe,sdf_opt, dataset_name, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from, wandb=None, logger=None, ply_path=None):
     first_iter = 0
     tb_writer = prepare_output_and_logger(dataset)
     gaussians = GaussianModel(dataset.feat_dim, dataset.n_offsets, dataset.voxel_size, dataset.update_depth, dataset.update_init_factor, dataset.update_hierachy_factor, dataset.use_feat_bank, 
@@ -90,6 +91,10 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
                               dataset.enable_idiv_iter, dataset.enable_ref_iter, dataset.deg_view)
     scene = Scene(dataset, gaussians, ply_path=ply_path, shuffle=False)
     gaussians.training_setup(opt)
+    
+    sdf_render = SDF_RENDER_DICT[sdf_opt.sdf_mode]({}).cuda()
+    sdf_render.training_setup(sdf_opt)
+    
     if checkpoint:
         (model_params, first_iter) = torch.load(checkpoint)
         gaussians.restore(model_params, opt)
@@ -130,6 +135,7 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
         if not viewpoint_stack:
             viewpoint_stack = scene.getTrainCameras().copy()
         viewpoint_cam = viewpoint_stack.pop(randint(0, len(viewpoint_stack)-1))
+        mask = viewpoint_cam.gt_alpha_mask.cuda()
 
         # Render
         if (iteration - 1) == debug_from:
@@ -206,6 +212,60 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
         for k in losses_extra.keys():
             loss += getattr(opt, f'lambda_{k}')* losses_extra[k]
 
+        # sdf loss
+        sdf_losses = {}
+        if iteration > sdf_opt.sdf_from_iter:
+            sdf_render.train()
+            if sdf_opt.sdf_init_iters > 0 and init_flag:
+                sdf_init(scene.getTrainCameras().copy(), sdf_opt, pipe, scene, render_fn,
+                        sdf_render, pretrained_iters=sdf_opt.sdf_init_iters)
+                init_flag = False
+            pos = render_pkg['pos'].permute(1, 2, 0)
+            depth = render_pkg['depth'].permute(1, 2, 0)
+            normal = render_pkg['normal'].permute(1, 2, 0)
+            acc = render_pkg['alpha'].permute(1, 2, 0)
+
+            viewdirs, valid_mask = viewpoint_cam.get_filtered_ray()
+            valid_normal = normal.view(-1, 3)
+            valid_depth = depth.view(-1, 1)
+            valid_viewdirs = viewdirs.view(-1, 3)
+            valid_pos = pos.view(-1, 3)
+            valid_acc = acc.view(-1, 1)
+            bs = valid_viewdirs.shape[0]
+            valid_gt = gt_image.permute(1, 2, 0).view(-1, 3)
+            if sdf_opt.batchify and bs > sdf_opt.batch_size:
+                idx = torch.randint(bs, [sdf_opt.batch_size])
+                valid_gt = valid_gt[idx]
+                valid_viewdirs = valid_viewdirs[idx]
+                valid_normal = valid_normal[idx]
+                valid_depth = valid_depth[idx]
+                valid_pos = valid_pos[idx]
+                valid_mask = mask.permute(1, 2, 0).view(-1, 1)[idx]
+                valid_acc = valid_acc[idx]
+                default_normal = torch.tensor([[0, 0, 1]]).float().cuda()
+                valid_normal = valid_normal * valid_acc + (1-valid_acc) * default_normal
+                valid_normal = F.normalize(valid_normal, dim=-1) 
+                bs = sdf_opt.batch_size
+            ray_batch = {
+                'rays_o': viewpoint_cam.camera_center.repeat(bs, 1),
+                'rgbs': valid_gt,
+                'dirs': valid_viewdirs, 
+                'step': iteration + sdf_opt.sdf_init_iters + 999999,
+                'masks': valid_mask,
+                'bg': background[None, :],
+                'depth': valid_depth,
+                'pos': valid_pos,
+                'normal': valid_normal,
+                "acc": valid_acc,
+                'pretrained': False,
+            }
+            tensosdf_output = sdf_render(ray_batch,)
+            for key in tensosdf_output.keys():
+                if key.find('loss') > -1:
+                    sdf_loss = tensosdf_output[key].mean()* getattr(sdf_opt, f'lambda_'+key[5:])
+                    sdf_losses[key] = sdf_loss 
+                    loss += sdf_loss
+
         loss.backward()
         
         iter_end.record()
@@ -247,6 +307,78 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
             if (iteration in checkpoint_iterations):
                 logger.info("\n[ITER {}] Saving Checkpoint".format(iteration))
                 torch.save((gaussians.capture(), iteration), scene.model_path + "/chkpnt" + str(iteration) + ".pth")
+
+def sdf_init(train_cams, sdf_opt, pipe, scene, render_fn, sdf_render, pretrained_iters=1000):
+    sdf_losses = {}
+    background = torch.rand((3)).cuda()
+    batch_size = 2048
+    gs_pos = scene.gaussians.get_xyz
+    min_v = torch.min(gs_pos.min(0)[0]*1.2, -torch.ones_like(gs_pos.min(0)[0])*1.5).detach().clone()
+    max_v = torch.max(gs_pos.max(0)[0]*1.2, torch.ones_like(gs_pos.max(0)[0])*1.5).detach().clone()
+    aabb = torch.cat([min_v, max_v], 0).view(2, 3)
+    sdf_render.update_aabb(aabb)
+    for i in tqdm(range(pretrained_iters)):
+        viewpoint_cam = train_cams[randint(0, len(train_cams)-1)]
+        gt_image = viewpoint_cam.original_image.cuda()
+        mask = viewpoint_cam.gt_alpha_mask.cuda()
+        mask[mask < 0.5] = 0
+        mask[mask >= 0.5] = 1
+        gt_image = gt_image * mask + background[:, None, None] * (1-mask)
+        render_pkg = render_fn(viewpoint_cam, scene, pipe, background, 
+                            debug=False, is_training=True, attr_only=True)
+        pos = render_pkg['pos'].permute(1, 2, 0)
+        depth = render_pkg['depth'].permute(1, 2, 0).detach()
+        normal = render_pkg['normal'].permute(1, 2, 0).detach()
+        acc = render_pkg['alpha'].permute(1, 2, 0)
+
+        viewdirs, valid_mask = viewpoint_cam.get_filtered_ray()
+        valid_normal = normal.view(-1, 3)
+        valid_depth = depth.view(-1, 1)
+        valid_viewdirs = viewdirs.view(-1, 3)
+        valid_pos = pos.view(-1, 3)
+        valid_acc = acc.view(-1, 1)
+        bs = valid_viewdirs.shape[0]
+        valid_gt = gt_image.permute(1, 2, 0).view(-1, 3)
+        if  bs > batch_size:
+            idx = torch.randint(bs, [batch_size])
+            valid_gt = valid_gt[idx]
+            valid_viewdirs = valid_viewdirs[idx]
+            valid_normal = valid_normal[idx]
+            valid_depth = valid_depth[idx]
+            valid_pos = valid_pos[idx]
+            valid_mask = mask.permute(1, 2, 0).view(-1, 1)[idx]
+            valid_acc = valid_acc[idx]
+            default_normal = torch.tensor([[0, 0, 1]]).float().cuda()
+            valid_normal = valid_normal * valid_acc + (1-valid_acc) * default_normal
+            valid_normal = F.normalize(valid_normal, dim=-1) 
+            bs = batch_size
+        ray_batch = {
+            'rays_o': viewpoint_cam.camera_center.repeat(bs, 1),
+            'rgbs': valid_gt,
+            'dirs': valid_viewdirs, 
+            'step': i,
+            'masks': valid_mask,
+            'bg': background[None, :],
+            'depth': valid_depth,
+            'pos': valid_pos,
+            'normal': valid_normal,
+        }
+        tensosdf_output = sdf_render(ray_batch,)
+        loss = torch.tensor(0.).cuda().float()
+        for key in tensosdf_output.keys():
+            if key.find('sdf2g') > -1:
+                continue
+            if key.find('loss') > -1:
+                sdf_loss = tensosdf_output[key].mean()* getattr(sdf_opt, f'lambda_'+key[5:])
+                sdf_losses[key] = sdf_loss 
+                loss += sdf_loss
+        sdf_render.optimizer.zero_grad()
+        loss.backward()
+        sdf_render.optimizer.step()
+    scene.gaussians.optimizer.zero_grad(set_to_none=True)    
+    if sdf_opt.sdf_mode.find("Tenso") > -1:
+        new_aabb = sdf_render.updateAlphaMask()
+        print('new_aabb: ', new_aabb)
 
 def prepare_output_and_logger(args):    
     if not args.model_path:
@@ -525,6 +657,7 @@ if __name__ == "__main__":
     lp = ModelParams(parser)
     op = OptimizationParams(parser)
     pp = PipelineParams(parser)
+    sdfop = TensoSDFOptimParams(parser)
     parser.add_argument('--ip', type=str, default="127.0.0.1")
     parser.add_argument('--port', type=int, default=6009)
     parser.add_argument('--debug_from', type=int, default=-1)
@@ -595,7 +728,9 @@ if __name__ == "__main__":
     if args.warmup:
         logger.info("\n Warmup finished! Reboot from last checkpoints")
         new_ply_path = os.path.join(args.model_path, f'point_cloud/iteration_{args.iterations}', 'point_cloud.ply')
-        training(lp.extract(args), op.extract(args), pp.extract(args), dataset,  args.test_iterations, args.save_iterations, args.checkpoint_iterations, args.start_checkpoint, args.debug_from, wandb=wandb, logger=logger, ply_path=new_ply_path)
+        training(lp.extract(args), op.extract(args), pp.extract(args)
+                 , sdfop
+                 , dataset,  args.test_iterations, args.save_iterations, args.checkpoint_iterations, args.start_checkpoint, args.debug_from, wandb=wandb, logger=logger, ply_path=new_ply_path)
 
     # All done
     logger.info("\nTraining complete.")

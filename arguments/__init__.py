@@ -44,6 +44,47 @@ class ParamGroup:
                 setattr(group, arg[0], arg[1])
         return group
 
+class TensoSDFOptimParams(ParamGroup): 
+    def __init__(self, parser, sentinel=False):
+        self.lr_xyz_init = 1e-2
+        self.lr_net_init = 1e-3
+        self.lr_factor = 1.
+        self.pre_lr_factor = 1.
+        self.lambda_eikonal = 0.1
+        self.lambda_hessian = 0.0005
+        self.lambda_sparse = 0.05
+        self.lambda_tv_sdf = 0.1
+        self.lambda_occ = 0.
+        self.lambda_rgb = 1.
+        self.lambda_mask = 1
+        self.lambda_sdf_large = 1.
+        self.lambda_sdf_small = 1.
+        self.lambda_depth_g2sdf = 0.5
+        self.lambda_depth_sdf2g = 0.5
+        self.lambda_normal_g2sdf = 0.5
+        self.lambda_normal_sdf2g = 0.5
+        self.lambda_gaussian = 1e-5
+        self.lambda_radiance = 1.
+
+        self.pretrain_sdf = ""
+
+        self.sdf_from_iter = 1000
+        self.batchify = False
+        self.batch_size = 2048
+        self.sdf_init_iters = 1000
+
+        self.update_alpha_mask_list = [2000, 10000] # [2000, 10000]
+        self.upsample_list = [2000, 10000] # [2000, 10000]
+
+        self.sdf_mode = 'TensoSDF'
+        self.decay = False
+        self.lr_decay_target_ratio = 5e-2
+        self.lr_decay_iters = 6000
+
+        self.gridSize = 128
+        
+        super().__init__(parser, "TensoSDF Optimization Parameters", sentinel)
+
 class ModelParams(ParamGroup): 
     def __init__(self, parser, sentinel=False):
         self.sh_degree = 3
