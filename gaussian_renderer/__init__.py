@@ -263,6 +263,16 @@ def render(viewpoint_camera, pc : GaussianModel, pipe,
             scales = scaling,
             rotations = rot,
             cov3D_precomp = None)[0]
+        
+        out["pos"] =  rasterizer_nobg(
+            means3D = xyz,
+            means2D = screenspace_points,
+            shs = None,
+            colors_precomp = xyz,
+            opacities = opacity,
+            scales = scaling,
+            rotations = rot,
+            cov3D_precomp = None)[0]
 
         p_hom = torch.cat([xyz, torch.ones_like(xyz[...,:1])], -1).unsqueeze(-1)
         p_view = torch.matmul(viewpoint_camera.world_view_transform.transpose(0,1), p_hom)

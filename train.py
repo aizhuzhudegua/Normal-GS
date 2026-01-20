@@ -47,6 +47,7 @@ from utils.graphics_utils import normalize_rendered_by_weights, render_normal_fr
 from utils.image_utils import linear_to_srgb
 import torch.nn.functional as F
 from fields.shape_renders import SDF_RENDER_DICT
+from gaussian_renderer import render_fn_dict
 
 # torch.set_num_threads(32)
 lpips_fn = lpips.LPIPS(net='vgg').to('cuda')
@@ -94,7 +95,8 @@ def training(dataset, opt, pipe,sdf_opt, dataset_name, testing_iterations, savin
     
     sdf_render = SDF_RENDER_DICT[sdf_opt.sdf_mode]({}).cuda()
     sdf_render.training_setup(sdf_opt)
-    
+    """ Prepare render function and bg"""
+    render_fn = render
     if checkpoint:
         (model_params, first_iter) = torch.load(checkpoint)
         gaussians.restore(model_params, opt)
@@ -107,22 +109,7 @@ def training(dataset, opt, pipe,sdf_opt, dataset_name, testing_iterations, savin
     progress_bar = tqdm(range(first_iter, opt.iterations), desc="Training progress")
     first_iter += 1
     for iteration in range(first_iter, opt.iterations + 1):
-        # network gui not available in scaffold-gs yet
-        if network_gui.conn == None:
-            network_gui.try_connect()
-        while network_gui.conn != None:
-            try:
-                net_image_bytes = None
-                custom_cam, do_training, pipe.convert_SHs_python, pipe.compute_cov3D_python, keep_alive, scaling_modifer = network_gui.receive()
-                if custom_cam != None:
-                    net_image = render(custom_cam, gaussians, pipe, background, scaling_modifer)["render"]
-                    net_image_bytes = memoryview((torch.clamp(net_image, min=0, max=1.0) * 255).byte().permute(1, 2, 0).contiguous().cpu().numpy())
-                network_gui.send(net_image_bytes, dataset.source_path)
-                if do_training and ((iteration < int(opt.iterations)) or not keep_alive):
-                    break
-            except Exception as e:
-                network_gui.conn = None
-
+     
         iter_start.record()
 
         gaussians.update_render_status(iteration)
@@ -324,8 +311,11 @@ def sdf_init(train_cams, sdf_opt, pipe, scene, render_fn, sdf_render, pretrained
         mask[mask < 0.5] = 0
         mask[mask >= 0.5] = 1
         gt_image = gt_image * mask + background[:, None, None] * (1-mask)
-        render_pkg = render_fn(viewpoint_cam, scene, pipe, background, 
-                            debug=False, is_training=True, attr_only=True)
+      
+        voxel_visible_mask = prefilter_voxel(viewpoint_cam, scene.gaussians, pipe,background)
+        retain_grad = True
+        render_pkg = render_fn(viewpoint_cam, scene.gaussians, pipe, background, visible_mask=voxel_visible_mask, retain_grad=retain_grad,
+                            render_n=True, render_dotprod=True, render_full=True)
         pos = render_pkg['pos'].permute(1, 2, 0)
         depth = render_pkg['depth'].permute(1, 2, 0).detach()
         normal = render_pkg['normal'].permute(1, 2, 0).detach()
