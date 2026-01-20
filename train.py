@@ -89,7 +89,7 @@ def training(dataset, opt, pipe,sdf_opt, dataset_name, testing_iterations, savin
     gaussians = GaussianModel(dataset.feat_dim, dataset.n_offsets, dataset.voxel_size, dataset.update_depth, dataset.update_init_factor, dataset.update_hierachy_factor, dataset.use_feat_bank, 
                               dataset.appearance_dim, dataset.ratio, dataset.add_opacity_dist, dataset.add_cov_dist, dataset.add_color_dist, dataset.idiv, dataset.ref,
                               dataset.enable_idiv_iter, dataset.enable_ref_iter, dataset.deg_view)
-    scene = Scene(dataset, gaussians, ply_path=ply_path, shuffle=False)
+    scene = Scene(dataset, gaussians)
     gaussians.training_setup(opt)
     
     sdf_render = SDF_RENDER_DICT[sdf_opt.sdf_mode]({}).cuda()
