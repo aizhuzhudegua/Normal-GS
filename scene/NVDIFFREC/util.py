@@ -10,9 +10,10 @@
 import os
 import numpy as np
 import torch
+import torch.nn as nn
 import nvdiffrast.torch as dr
 import imageio
-
+import torch.nn.functional as F
 #----------------------------------------------------------------------------
 # Vector operations
 #----------------------------------------------------------------------------
@@ -32,30 +33,6 @@ def safe_normalize(x: torch.Tensor, eps: float =1e-20) -> torch.Tensor:
 def to_hvec(x: torch.Tensor, w: float) -> torch.Tensor:
     return torch.nn.functional.pad(x, pad=(0,1), mode='constant', value=w)
 
-#----------------------------------------------------------------------------
-# sRGB color transforms
-#----------------------------------------------------------------------------
-
-def _rgb_to_srgb(f: torch.Tensor) -> torch.Tensor:
-    return torch.where(f <= 0.0031308, f * 12.92, torch.pow(torch.clamp(f, 0.0031308), 1.0/2.4)*1.055 - 0.055)
-
-def rgb_to_srgb(f: torch.Tensor) -> torch.Tensor:
-    assert f.shape[-1] == 3 or f.shape[-1] == 4
-    out = torch.cat((_rgb_to_srgb(f[..., 0:3]), f[..., 3:4]), dim=-1) if f.shape[-1] == 4 else _rgb_to_srgb(f)
-    assert out.shape[0] == f.shape[0] and out.shape[1] == f.shape[1] and out.shape[2] == f.shape[2]
-    return out
-
-def _srgb_to_rgb(f: torch.Tensor) -> torch.Tensor:
-    return torch.where(f <= 0.04045, f / 12.92, torch.pow((torch.clamp(f, 0.04045) + 0.055) / 1.055, 2.4))
-
-def srgb_to_rgb(f: torch.Tensor) -> torch.Tensor:
-    assert f.shape[-1] == 3 or f.shape[-1] == 4
-    out = torch.cat((_srgb_to_rgb(f[..., 0:3]), f[..., 3:4]), dim=-1) if f.shape[-1] == 4 else _srgb_to_rgb(f)
-    assert out.shape[0] == f.shape[0] and out.shape[1] == f.shape[1] and out.shape[2] == f.shape[2]
-    return out
-
-def reinhard(f: torch.Tensor) -> torch.Tensor:
-    return f/(1+f)
 
 #-----------------------------------------------------------------------------------
 # Metrics (taken from jaxNerf source code, in order to replicate their measurements)
@@ -108,6 +85,27 @@ def latlong_to_cubemap(latlong_map, res):
                                 # indexing='ij')
                                 )
         v = safe_normalize(cube_to_dir(s, gx, gy))
+
+        tu = torch.atan2(v[..., 0:1], -v[..., 2:3]) / (2 * np.pi) + 0.5
+        tv = torch.acos(torch.clamp(v[..., 1:2], min=-1, max=1)) / np.pi
+        texcoord = torch.cat((tu, tv), dim=-1)
+
+        cubemap[s, ...] = dr.texture(latlong_map[None, ...], texcoord[None, ...], filter_mode='linear')[0]
+    return cubemap
+
+def latlong_to_cubemap2(latlong_map, res, trans_mat=None):
+    cubemap = torch.zeros(6, res[0], res[1], latlong_map.shape[-1], dtype=torch.float32, device='cuda')
+    for s in range(6):
+        gy, gx = torch.meshgrid(torch.linspace(-1.0 + 1.0 / res[0], 1.0 - 1.0 / res[0], res[0], device='cuda'), 
+                                torch.linspace(-1.0 + 1.0 / res[1], 1.0 - 1.0 / res[1], res[1], device='cuda'),
+                                # indexing='ij')
+                                )
+        if trans_mat is None:
+            # for glossy
+            transform_mat = torch.tensor([[0, 0, -1], [0, 1, 0], [1, 0, 0]]).cuda().float()
+        else:
+            transform_mat = trans_mat.cuda().float()
+        v = safe_normalize(cube_to_dir(s, gx, gy)) @ transform_mat
 
         tu = torch.atan2(v[..., 0:1], -v[..., 2:3]) / (2 * np.pi) + 0.5
         tv = torch.acos(torch.clamp(v[..., 1:2], min=-1, max=1)) / np.pi
@@ -481,3 +479,633 @@ def checkerboard(res, checker_size) -> np.ndarray:
     check = check[:res[0], :res[1]]
     return np.stack((check, check, check), axis=-1)
 
+#----------------------------------------------------------------------------
+# NeRO utils
+class IdentityActivation(nn.Module):
+    def forward(self, x): return x
+
+class ExpActivation(nn.Module):
+    def __init__(self, max_light=5.0):
+        super().__init__()
+        self.max_light=max_light
+
+    def forward(self, x):
+        return torch.exp(torch.clamp(x, max=self.max_light))
+    
+import torch.nn as nn
+def make_predictor(feats_dim: object, output_dim: object, weight_norm: object = True, activation='sigmoid', exp_max=0.0) -> object:
+    if activation == 'sigmoid':
+        activation = nn.Sigmoid()
+    elif activation=='exp':
+        activation = ExpActivation(max_light=exp_max)
+    elif activation=='none':
+        activation = IdentityActivation()
+    elif activation=='relu':
+        activation = nn.ReLU()
+    else:
+        raise NotImplementedError
+
+    run_dim = 256
+    if weight_norm:
+        module=nn.Sequential(
+            nn.utils.weight_norm(nn.Linear(feats_dim, run_dim)),
+            nn.ReLU(),
+            nn.utils.weight_norm(nn.Linear(run_dim, run_dim)),
+            nn.ReLU(),
+            nn.utils.weight_norm(nn.Linear(run_dim, run_dim)),
+            nn.ReLU(),
+            nn.utils.weight_norm(nn.Linear(run_dim, output_dim)),
+            activation,
+        )
+    else:
+        module=nn.Sequential(
+            nn.Linear(feats_dim, run_dim),
+            nn.ReLU(),
+            nn.Linear(run_dim, run_dim),
+            nn.ReLU(),
+            nn.Linear(run_dim, run_dim),
+            nn.ReLU(),
+            nn.Linear(run_dim, output_dim),
+            activation,
+        )
+
+    return module
+
+def offset_points_to_sphere(points):
+    points_norm = torch.norm(points, dim=-1)
+    mask = points_norm > 0.999
+    if torch.sum(mask)>0:
+        points = torch.clone(points)
+        points[mask] /= points_norm[mask].unsqueeze(-1)
+        points[mask] *= 0.999
+        # points[points_norm>0.999] = 0
+    return points
+
+def get_sphere_intersection(pts, dirs):
+    dtx = torch.sum(pts*dirs,dim=-1,keepdim=True) # rn,1
+    xtx = torch.sum(pts**2,dim=-1,keepdim=True) # rn,1
+    dist = dtx ** 2 - xtx + 1
+    assert torch.sum(dist<0)==0
+    dist = -dtx + torch.sqrt(dist+1e-6) # rn,1
+    return dist
+
+
+def generalized_binomial_coeff(a, k):
+    """Compute generalized binomial coefficients."""
+    return np.prod(a - np.arange(k)) / np.math.factorial(k)
+
+
+def assoc_legendre_coeff(l, m, k):
+    """Compute associated Legendre polynomial coefficients.
+
+      Returns the coefficient of the cos^k(theta)*sin^m(theta) term in the
+      (l, m)th associated Legendre polynomial, P_l^m(cos(theta)).
+
+      Args:
+        l: associated Legendre polynomial degree.
+        m: associated Legendre polynomial order.
+        k: power of cos(theta).
+
+      Returns:
+        A float, the coefficient of the term corresponding to the inputs.
+    """
+    return ((-1)**m * 2**l * np.math.factorial(l) / np.math.factorial(k) /
+          np.math.factorial(l - k - m) *
+          generalized_binomial_coeff(0.5 * (l + k + m - 1.0), l))
+
+
+def sph_harm_coeff(l, m, k):
+  """Compute spherical harmonic coefficients."""
+  return (np.sqrt(
+      (2.0 * l + 1.0) * np.math.factorial(l - m) /
+      (4.0 * np.pi * np.math.factorial(l + m))) * assoc_legendre_coeff(l, m, k))
+
+
+
+def get_ml_array(deg_view):
+    """Create a list with all pairs of (l, m) values to use in the encoding."""
+    ml_list = []
+    for i in range(deg_view):
+        l = 2**i
+        # Only use nonnegative m values, later splitting real and imaginary parts.
+        for m in range(l + 1):
+            ml_list.append((m, l))
+
+    # Convert list into a numpy array.
+    ml_array = np.array(ml_list).T
+    return ml_array
+
+def generate_ide_fn(deg_view):
+    """Generate integrated directional encoding (IDE) function.
+
+      This function returns a function that computes the integrated directional
+      encoding from Equations 6-8 of arxiv.org/abs/2112.03907.
+
+      Args:
+        deg_view: number of spherical harmonics degrees to use.
+
+      Returns:
+        A function for evaluating integrated directional encoding.
+
+      Raises:
+        ValueError: if deg_view is larger than 5.
+    """
+    if deg_view > 5:
+        raise ValueError('Only deg_view of at most 5 is numerically stable.')
+
+    ml_array = get_ml_array(deg_view)
+    l_max = 2**(deg_view - 1)
+
+    # Create a matrix corresponding to ml_array holding all coefficients, which,
+    # when multiplied (from the right) by the z coordinate Vandermonde matrix,
+    # results in the z component of the encoding.
+    mat = np.zeros((l_max + 1, ml_array.shape[1]))
+    for i, (m, l) in enumerate(ml_array.T):
+        for k in range(l - m + 1):
+            mat[k, i] = sph_harm_coeff(l, m, k)
+
+    mat = torch.from_numpy(mat.astype(np.float32)).cuda()
+    ml_array = torch.from_numpy(ml_array.astype(np.float32)).cuda()
+
+    def integrated_dir_enc_fn(xyz, kappa_inv):
+        """Function returning integrated directional encoding (IDE).
+
+        Args:
+          xyz: [..., 3] array of Cartesian coordinates of directions to evaluate at.
+          kappa_inv: [..., 1] reciprocal of the concentration parameter of the von
+            Mises-Fisher distribution.
+
+        Returns:
+          An array with the resulting IDE.
+        """
+        x = xyz[..., 0:1]
+        y = xyz[..., 1:2]
+        z = xyz[..., 2:3]
+
+        # Compute z Vandermonde matrix.
+        vmz = torch.concat([z**i for i in range(mat.shape[0])], dim=-1)
+
+        # Compute x+iy Vandermonde matrix.
+        vmxy = torch.concat([(x + 1j * y + 1e-10)**m for m in ml_array[0, :]], dim=-1)
+       
+        # Get spherical harmonics.
+        sph_harms = vmxy * torch.matmul(vmz, mat)
+
+        # Apply attenuation function using the von Mises-Fisher distribution
+        # concentration parameter, kappa.
+        sigma = 0.5 * ml_array[1, :] * (ml_array[1, :] + 1)
+        sigma = sigma.cuda()
+        ide = sph_harms.cuda() * torch.exp(-sigma * kappa_inv).cuda()
+
+        # Split into real and imaginary parts and return
+        return torch.concat([torch.real(ide), torch.imag(ide)], dim=-1).cuda()
+
+    return integrated_dir_enc_fn
+
+def get_lat_long():
+    res = (1080, 1080*3)
+    gy, gx = torch.meshgrid(torch.linspace(0.0 + 1.0 / res[0], 1.0 - 1.0 / res[0], res[0], device='cuda'),
+                            torch.linspace(-1.0 + 1.0 / res[1], 1.0 - 1.0 / res[1], res[1], device='cuda'),
+                            indexing='ij') # [h,w]
+
+    sintheta, costheta = torch.sin(gy * np.pi), torch.cos(gy * np.pi)
+    sinphi, cosphi = torch.sin(gx * np.pi), torch.cos(gx * np.pi)
+    reflvec = torch.stack((sintheta * sinphi, costheta, -sintheta * cosphi), dim=-1)
+    return reflvec
+
+# Positional encoding embedding. Code was taken from https://github.com/bmild/nerf.
+class Embedder:
+    def __init__(self, **kwargs):
+        self.kwargs = kwargs
+        self.create_embedding_fn()
+
+    def create_embedding_fn(self):
+        embed_fns = []
+        d = self.kwargs['input_dims']
+        out_dim = 0
+        if self.kwargs['include_input']:
+            embed_fns.append(lambda x: x)
+            out_dim += d
+
+        max_freq = self.kwargs['max_freq_log2']
+        N_freqs = self.kwargs['num_freqs']
+
+        if self.kwargs['log_sampling']:
+            freq_bands = 2. ** torch.linspace(0., max_freq, N_freqs)
+        else:
+            freq_bands = torch.linspace(2.**0., 2.**max_freq, N_freqs)
+
+        for freq in freq_bands:
+            for p_fn in self.kwargs['periodic_fns']:
+                embed_fns.append(lambda x, p_fn=p_fn, freq=freq: p_fn(x * freq))
+                out_dim += d
+
+        self.embed_fns = embed_fns
+        self.out_dim = out_dim
+
+    def embed(self, inputs):
+        return torch.cat([fn(inputs) for fn in self.embed_fns], -1)
+
+def get_embedder(multires, input_dims=3):
+    embed_kwargs = {
+        'include_input': True,
+        'input_dims': input_dims,
+        'max_freq_log2': multires-1,
+        'num_freqs': multires,
+        'log_sampling': True,
+        'periodic_fns': [torch.sin, torch.cos],
+    }
+
+    embedder_obj = Embedder(**embed_kwargs)
+    def embed(x, eo=embedder_obj): return eo.embed(x)
+    return embed, embedder_obj.out_dim
+
+
+def linear2srgb_torch(tensor_0to1):
+    if isinstance(tensor_0to1, torch.Tensor):
+        pow_func = torch.pow
+        where_func = torch.where
+    elif isinstance(tensor_0to1, np.ndarray):
+        pow_func = np.power
+        where_func = np.where
+    else:
+        raise NotImplementedError(f'Do not support dtype {type(tensor_0to1)}')
+
+    srgb_linear_thres = 0.0031308
+    srgb_linear_coeff = 12.92
+    srgb_exponential_coeff = 1.055
+    srgb_exponent = 2.4
+
+    tensor_linear = tensor_0to1 * srgb_linear_coeff
+    
+    tensor_nonlinear = srgb_exponential_coeff * (
+        pow_func(tensor_0to1 + 1e-6, 1 / srgb_exponent)
+    ) - (srgb_exponential_coeff - 1)
+
+    is_linear = tensor_0to1 <= srgb_linear_thres
+    tensor_srgb = where_func(is_linear, tensor_linear, tensor_nonlinear)
+
+    return tensor_srgb
+
+#-----------------------------------------------------------------------------------
+# Relightable Gaussian
+
+C0 = 0.28209479177387814
+C1 = 0.4886025119029199
+C2 = [
+    1.0925484305920792,
+    -1.0925484305920792,
+    0.31539156525252005,
+    -1.0925484305920792,
+    0.5462742152960396
+]
+C3 = [
+    -0.5900435899266435,
+    2.890611442640554,
+    -0.4570457994644658,
+    0.3731763325901154,
+    -0.4570457994644658,
+    1.445305721320277,
+    -0.5900435899266435
+]
+C4 = [
+    2.5033429417967046,
+    -1.7701307697799304,
+    0.9461746957575601,
+    -0.6690465435572892,
+    0.10578554691520431,
+    -0.6690465435572892,
+    0.47308734787878004,
+    -1.7701307697799304,
+    0.6258357354491761,
+]
+
+def rotation_between_z(vec):
+    """
+    https://math.stackexchange.com/questions/180418/calculate-rotation-matrix-to-align-vector-a-to-vector-b-in-3d/476311#476311
+    Args:
+        vec: [..., 3]
+
+    Returns:
+        R: [..., 3, 3]
+
+    """
+    v1 = -vec[..., 1]
+    v2 = vec[..., 0]
+    v3 = torch.zeros_like(v1)
+    v11 = v1 * v1
+    v22 = v2 * v2
+    v33 = v3 * v3
+    v12 = v1 * v2
+    v13 = v1 * v3
+    v23 = v2 * v3
+    cos_p_1 = (vec[..., 2] + 1).clamp_min(1e-7)
+    R = torch.zeros(vec.shape[:-1] + (3, 3,), dtype=torch.float32, device="cuda")
+    R[..., 0, 0] = 1 + (-v33 - v22) / cos_p_1
+    R[..., 0, 1] = -v3 + v12 / cos_p_1
+    R[..., 0, 2] = v2 + v13 / cos_p_1
+    R[..., 1, 0] = v3 + v12 / cos_p_1
+    R[..., 1, 1] = 1 + (-v33 - v11) / cos_p_1
+    R[..., 1, 2] = -v1 + v23 / cos_p_1
+    R[..., 2, 0] = -v2 + v13 / cos_p_1
+    R[..., 2, 1] = v1 + v23 / cos_p_1
+    R[..., 2, 2] = 1 + (-v22 - v11) / cos_p_1
+    R = torch.where((vec[..., 2] + 1 > 0)[..., None, None], R,
+                    -torch.eye(3, dtype=torch.float32, device="cuda").expand_as(R))
+    return R
+
+def fibonacci_sphere_sampling(normals, sample_num, random_rotate=True):
+    pre_shape = normals.shape[:-1]
+    if len(pre_shape) > 1:
+        normals = normals.reshape(-1, 3)
+    delta = np.pi * (3.0 - np.sqrt(5.0))
+
+    # fibonacci sphere sample around z axis
+    idx = torch.arange(sample_num, dtype=torch.float, device='cuda')[None]
+    z = 1 - 2 * idx / (2 * sample_num - 1)
+    rad = torch.sqrt(1 - z ** 2)
+    theta = delta * idx
+    if random_rotate:
+        theta = torch.rand(*pre_shape, 1, device='cuda') * 2 * np.pi + theta
+    y = torch.cos(theta) * rad
+    x = torch.sin(theta) * rad
+    z_samples = torch.stack([x, y, z.expand_as(y)], dim=-2)
+
+    # rotate to normal
+    # z_vector = torch.zeros_like(normals)
+    # z_vector[..., 2] = 1  # [H, W, 3]
+    # rotation_matrix = rotation_between_vectors(z_vector, normals)
+    rotation_matrix = rotation_between_z(normals)
+    incident_dirs = rotation_matrix @ z_samples
+    incident_dirs = F.normalize(incident_dirs, dim=-2).transpose(-1, -2)
+    incident_areas = torch.ones_like(incident_dirs)[..., 0:1] * 2 * np.pi
+    if len(pre_shape) > 1:
+        incident_dirs = incident_dirs.reshape(*pre_shape, sample_num, 3)
+        incident_areas = incident_areas.reshape(*pre_shape, sample_num, 1)
+    return incident_dirs, incident_areas
+
+def simple_fibonacci_sphere_sampling(sample_num):
+    phi = (np.sqrt(5)-1) * np.pi
+
+    # fibonacci sphere sample around z axis
+    idx = np.arange(sample_num) + 1
+    print(idx.shape)
+    z = (2*idx - 1) / sample_num - 1
+    rad = np.sqrt(1 - z ** 2)
+    theta = phi * idx 
+    y = np.cos(theta) * rad
+    x = np.sin(theta) * rad
+    z_samples = np.stack([x, y, z], axis=-1)
+    return z_samples
+
+
+def sample_incident_rays(normals, is_training=False, sample_num=24):
+    if is_training:
+        incident_dirs, incident_areas = fibonacci_sphere_sampling(
+            normals, sample_num, random_rotate=True)
+    else:
+        incident_dirs, incident_areas = fibonacci_sphere_sampling(
+            normals, sample_num, random_rotate=False)
+
+    return incident_dirs, incident_areas  # [N, S, 3], [N, S, 1]
+
+def eval_sh_coef(deg, dirs):
+    """
+    Evaluate spherical harmonics at unit directions
+    using hardcoded SH polynomials.
+    Works with torch/np/jnp.
+    ... Can be 0 or more batch dimensions.
+    Args:
+        deg: int SH deg. Currently, 0-3 supported
+        dirs: jnp.ndarray unit directions [..., 3]
+    Returns:
+        [..., C]
+    """
+    assert 4 >= deg >= 0
+    coeff = (deg + 1) ** 2
+    results = torch.zeros(dirs.shape[:-1] + (coeff,), device=dirs.device)
+    results[..., 0] = C0
+    if deg > 0:
+        x, y, z = dirs[..., 0], dirs[..., 1], dirs[..., 2]
+        results[..., 1] = -C1 * y
+        results[..., 2] = C1 * z
+        results[..., 3] = -C1 * x
+
+        if deg > 1:
+            xx, yy, zz = x * x, y * y, z * z
+            xy, yz, xz = x * y, y * z, x * z
+            results[..., 4] = C2[0] * xy
+            results[..., 5] = C2[1] * yz
+            results[..., 6] = C2[2] * (2.0 * zz - xx - yy)
+            results[..., 7] = C2[3] * xz
+            results[..., 8] = C2[4] * (xx - yy)
+
+            if deg > 2:
+                results[..., 9] = C3[0] * y * (3 * xx - yy)
+                results[..., 10] = C3[1] * xy * z
+                results[..., 11] = C3[2] * y * (4 * zz - xx - yy)
+                results[..., 12] = C3[3] * z * (2 * zz - 3 * xx - 3 * yy)
+                results[..., 13] = C3[4] * x * (4 * zz - xx - yy)
+                results[..., 14] = C3[5] * z * (xx - yy)
+                results[..., 15] = C3[6] * x * (xx - 3 * yy)
+
+                if deg > 3:
+                    results[..., 16] = C4[0] * xy * (xx - yy)
+                    results[..., 17] = C4[1] * yz * (3 * xx - yy)
+                    results[..., 18] = C4[2] * xy * (7 * zz - 1)
+                    results[..., 19] = C4[3] * yz * (7 * zz - 3)
+                    results[..., 20] = C4[4] * (zz * (35 * zz - 30) + 3)
+                    results[..., 21] = C4[5] * xz * (7 * zz - 3)
+                    results[..., 22] = C4[6] * (xx - yy) * (7 * zz - 1)
+                    results[..., 23] = C4[7] * xz * (xx - 3 * yy)
+                    results[..., 24] = C4[8] * (xx * (xx - 3 * yy) - yy * (3 * xx - yy))
+
+    return results 
+
+def _dot(a, b):
+        return (a * b).sum(dim=-1, keepdim=True)  # [H, W, 1, 1]
+
+def _f_diffuse(base_color, metallic):
+    return (1 - metallic) * base_color / np.pi  # [H, W, 1, 3]
+
+def _f_specular(h_d_n, h_d_o, n_d_i, n_d_o, base_color, roughness, metallic):
+    # used in SG, wrongly normalized
+    def _d_sg(r, cos):
+        r2 = (r * r).clamp(min=1e-7)
+        amp = 1 / (r2 * np.pi)
+        sharp = 2 / r2
+        return amp * torch.exp(sharp * (cos - 1))
+
+    D = _d_sg(roughness, h_d_n)
+
+    # Fresnel term F
+    F_0 = 0.04 * (1 - metallic) + base_color * metallic  # [H, W, 1, 3]
+    F = F_0 + (1.0 - F_0) * ((1.0 - h_d_o) ** 5)  # [H, W, S, 3]
+
+    # geometry term V, we use V = G / (4 * cos * cos) here
+    def _v_schlick_ggx(r, cos):
+        r2 = ((1 + r) ** 2) / 8
+        return 0.5 / (cos * (1 - r2) + r2).clamp(min=1e-7)
+
+    V = _v_schlick_ggx(roughness, n_d_i) * _v_schlick_ggx(roughness, n_d_o)  # [H, W, S, 1]
+
+    return D * F * V
+
+def rendering_equation_python(base_color, roughness, metallic, normals, viewdirs,
+                              incidents, is_training=False, direct_light_env_light=None,
+                              visibility=None, sample_num=24):
+    incident_dirs, incident_areas = sample_incident_rays(normals, is_training, sample_num)
+
+    base_color = base_color.unsqueeze(-2).contiguous()
+    roughness = roughness.unsqueeze(-2).contiguous()
+    metallic = metallic.unsqueeze(-2).contiguous()
+    normals = normals.unsqueeze(-2).contiguous()
+    viewdirs = viewdirs.unsqueeze(-2).contiguous()
+
+    deg = int(np.sqrt(visibility.shape[1]) - 1)
+    incident_dirs_coef = eval_sh_coef(deg, incident_dirs).unsqueeze(2)
+    shs_view = incidents.transpose(1, 2).view(base_color.shape[0], 1, 3, -1)
+    shs_visibility = visibility.transpose(1, 2).view(base_color.shape[0], 1, 1, -1)
+    local_incident_lights = torch.clamp_min((incident_dirs_coef[..., :shs_view.shape[-1]] * shs_view).sum(-1), 0)
+    if direct_light_env_light is not None:
+        shs_view_direct = direct_light_env_light.get_env_shs.transpose(1, 2).unsqueeze(1)
+        global_incident_lights = torch.clamp_min(
+            (incident_dirs_coef[..., :shs_view_direct.shape[-1]] * shs_view_direct).sum(-1) + 0.5, 0)
+    else:
+        global_incident_lights = torch.zeros_like(local_incident_lights, requires_grad=False)
+
+    incident_visibility = torch.clamp(
+        (incident_dirs_coef[..., :shs_visibility.shape[-1]] * shs_visibility).sum(-1) + 0.5, 0, 1)
+    global_incident_lights = global_incident_lights * incident_visibility
+    incident_lights = local_incident_lights + global_incident_lights
+
+    
+
+    half_dirs = incident_dirs + viewdirs
+    half_dirs = F.normalize(half_dirs, dim=-1)
+
+    h_d_n = _dot(half_dirs, normals).clamp(min=0)
+    h_d_o = _dot(half_dirs, viewdirs).clamp(min=0)
+    n_d_i = _dot(normals, incident_dirs).clamp(min=0)
+    n_d_o = _dot(normals, viewdirs).clamp(min=0)
+    f_d = _f_diffuse(base_color, metallic)
+    f_s = _f_specular(h_d_n, h_d_o, n_d_i, n_d_o, base_color, roughness, metallic)
+
+    transport = incident_lights * incident_areas * n_d_i  # （num_pts, num_sample, 3)
+    rgb_d = (f_d * transport).mean(dim=-2)
+    rgb_s = (f_s * transport).mean(dim=-2)
+    pbr = rgb_d + rgb_s
+    diffuse_light = transport.mean(dim=-2)
+
+    extra_results = {
+        "incident_dirs": incident_dirs,
+        "incident_lights": incident_lights,
+        "local_incident_lights": local_incident_lights,
+        "global_incident_lights": global_incident_lights,
+        "incident_visibility": incident_visibility,
+        "diffuse_light": diffuse_light,
+    }
+
+    return pbr, extra_results
+
+#------------------------------------------------------------------------------------
+# InvRender enc
+class MaterialNetwork(nn.Module):
+    def __init__(self, multires=8, out_dim=7, 
+                 brdf_encoder_dims=[256, 256, 256, 256],
+                 brdf_decoder_dims=[128, 128],
+                 latent_dim=32,
+                 ):
+        super().__init__()
+
+        self.embed_fn = None
+        if multires > 0:
+            self.brdf_embed_fn, brdf_input_dim = get_embedder(multires)
+
+
+        self.latent_dim = latent_dim
+        self.actv_fn = nn.LeakyReLU(0.2)
+        ############## spatially-varying BRDF ############
+        
+        print('BRDF encoder network size: ', brdf_encoder_dims)
+        print('BRDF decoder network size: ', brdf_decoder_dims)
+
+        brdf_encoder_layer = []
+        dim = brdf_input_dim
+        for i in range(len(brdf_encoder_dims)):
+            brdf_encoder_layer.append(nn.Linear(dim, brdf_encoder_dims[i]))
+            brdf_encoder_layer.append(self.actv_fn)
+            dim = brdf_encoder_dims[i]
+        brdf_encoder_layer.append(nn.Linear(dim, self.latent_dim))
+        self.brdf_encoder_layer = nn.Sequential(*brdf_encoder_layer)
+        
+        brdf_decoder_layer = []
+        dim = self.latent_dim
+        for i in range(len(brdf_decoder_dims)):
+            brdf_decoder_layer.append(nn.Linear(dim, brdf_decoder_dims[i]))
+            brdf_decoder_layer.append(self.actv_fn)
+            dim = brdf_decoder_dims[i]
+        brdf_decoder_layer.append(nn.Linear(dim, out_dim))
+        self.brdf_decoder_layer = nn.Sequential(*brdf_decoder_layer)
+
+
+    def forward(self, points):
+        if self.brdf_embed_fn is not None:
+            points = self.brdf_embed_fn(points)
+
+        brdf_lc = torch.sigmoid(self.brdf_encoder_layer(points))
+        brdf = torch.sigmoid(self.brdf_decoder_layer(brdf_lc))
+
+        rand_lc = brdf_lc + torch.randn(brdf_lc.shape).cuda() * 0.01
+        random_xi_brdf = torch.sigmoid(self.brdf_decoder_layer(rand_lc))
+
+        ret = dict([
+            ('brdf', brdf),
+            ('random_brdf', random_xi_brdf),
+        ])
+        return ret
+
+##### Visibility MLP
+def positional_encoding(positions, freqs):
+        freq_bands = (2**torch.arange(freqs).float()).to(positions.device)  # (F,)
+        pts = (positions[..., None] * freq_bands).reshape(
+            positions.shape[:-1] + (freqs * positions.shape[-1], ))  # (..., DF)
+        pts = torch.cat([torch.sin(pts), torch.cos(pts)], dim=-1)
+        return pts
+
+class VisibilityMLP(nn.Module):
+    def __init__(self, pospe=3, viewpe=3, hidden_dim=64) -> None:
+        super().__init__()
+        self.pospe = pospe
+        self.viewpe = viewpe
+        self.pos_mlp = nn.Sequential(
+            nn.Linear(2 * pospe * 3 + 3, hidden_dim),
+            nn.ReLU(True),
+            nn.Linear(hidden_dim, hidden_dim)
+        )
+        self.view_mlp = nn.Sequential(
+            nn.Linear(hidden_dim + 2 * viewpe * 3 + 3, hidden_dim),
+            nn.ReLU(True),
+            nn.Linear(hidden_dim, 1)
+        )
+        
+    def forward(self, pos, viewdir):
+        feat = self.pos_mlp(torch.cat([pos, positional_encoding(pos, self.pospe)], -1))
+        vis = self.view_mlp(torch.cat([pos, positional_encoding(viewdir, self.viewpe), feat], -1))
+        return vis
+
+class VisibilitySHMLP(nn.Module):
+    def __init__(self, pospe=3, hidden_dim=64) -> None:
+        super().__init__()
+        self.pospe = pospe
+        self.vis_mlp = nn.Sequential(
+            nn.Linear(2 * pospe * 3 + 3, hidden_dim),
+            nn.ReLU(True),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU(True),
+            nn.Linear(hidden_dim, 16)
+        )
+        
+    def forward(self, pos):
+        feat = self.vis_mlp(torch.cat([pos, positional_encoding(pos, self.pospe)], -1))
+        return feat
