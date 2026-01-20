@@ -13,6 +13,9 @@ import torch
 import math
 import numpy as np
 from typing import NamedTuple
+from kornia.core import Tensor, stack
+from kornia.utils._compat import torch_meshgrid
+from torch import Tensor
 
 class BasicPointCloud(NamedTuple):
     points : np.array
@@ -140,3 +143,79 @@ def render_normal_from_depth(viewpoint_cam, depth):
 
     normal_ref = normal_ref.permute(2,0,1)
     return normal_ref
+
+def create_meshgrid(
+    height: int,
+    width: int,
+    normalized_coordinates: bool = True,
+    device: torch.device = None,
+    dtype: torch.dtype = None,
+) -> Tensor:
+    """Generate a coordinate grid for an image.
+
+    When the flag ``normalized_coordinates`` is set to True, the grid is
+    normalized to be in the range :math:`[-1,1]` to be consistent with the pytorch
+    function :py:func:`torch.nn.functional.grid_sample`.
+
+    Args:
+        height: the image height (rows).
+        width: the image width (cols).
+        normalized_coordinates: whether to normalize
+          coordinates in the range :math:`[-1,1]` in order to be consistent with the
+          PyTorch function :py:func:`torch.nn.functional.grid_sample`.
+        device: the device on which the grid will be generated.
+        dtype: the data type of the generated grid.
+
+    Return:
+        grid tensor with shape :math:`(1, H, W, 2)`.
+
+    Example:
+        >>> create_meshgrid(2, 2)
+        tensor([[[[-1., -1.],
+                  [ 1., -1.]],
+        <BLANKLINE>
+                 [[-1.,  1.],
+                  [ 1.,  1.]]]])
+
+        >>> create_meshgrid(2, 2, normalized_coordinates=False)
+        tensor([[[[0., 0.],
+                  [1., 0.]],
+        <BLANKLINE>
+                 [[0., 1.],
+                  [1., 1.]]]])
+    """
+    xs: Tensor = torch.linspace(0, width - 1, width, device=device, dtype=dtype)
+    ys: Tensor = torch.linspace(0, height - 1, height, device=device, dtype=dtype)
+    # Fix TracerWarning
+    # Note: normalize_pixel_coordinates still gots TracerWarning since new width and height
+    #       tensors will be generated.
+    # Below is the code using normalize_pixel_coordinates:
+    # base_grid: torch.Tensor = torch.stack(torch.meshgrid([xs, ys]), dim=2)
+    # if normalized_coordinates:
+    #     base_grid = K.geometry.normalize_pixel_coordinates(base_grid, height, width)
+    # return torch.unsqueeze(base_grid.transpose(0, 1), dim=0)
+    if normalized_coordinates:
+        xs = (xs / (width - 1) - 0.5) * 2
+        ys = (ys / (height - 1) - 0.5) * 2
+    # generate grid by stacking coordinates
+    # TODO: torchscript doesn't like `torch_version_ge`
+    # if torch_version_ge(1, 13, 0):
+    #     x, y = torch_meshgrid([xs, ys], indexing="xy")
+    #     return stack([x, y], -1).unsqueeze(0)  # 1xHxWx2
+    # TODO: remove after we drop support of old versions
+    base_grid: Tensor = stack(torch_meshgrid([xs, ys], indexing="ij"), dim=-1)  # WxHx2
+    return base_grid.permute(1, 0, 2).unsqueeze(0)  # 1xHxWx2
+
+
+def get_rays(width, height, focal, c2w):
+    grid = create_meshgrid(height, width, normalized_coordinates=False)[0] + 0.5 # 1xHxWx2
+
+    i, j = grid.unbind(-1)
+    # the direction here is without +0.5 pixel centering as calibration is not so accurate
+    # see https://github.com/bmild/nerf/issues/24
+    cent = [width / 2, height / 2]
+    directions = torch.stack([(i - cent[0]) / focal[0], (j - cent[1]) / focal[1], torch.ones_like(i)], -1)  # (H, W, 3)
+    directions = directions / torch.norm(directions, dim=-1, keepdim=True)
+    rays_d = directions.cuda() @ c2w[:3, :3].T
+    return rays_d
+
