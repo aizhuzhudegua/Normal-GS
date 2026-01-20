@@ -299,7 +299,7 @@ def sdf_init(train_cams, sdf_opt, pipe, scene, render_fn, sdf_render, pretrained
     sdf_losses = {}
     background = torch.rand((3)).cuda()
     batch_size = 2048
-    gs_pos = scene.gaussians.get_xyz
+    gs_pos = scene.gaussians.get_anchor()
     min_v = torch.min(gs_pos.min(0)[0]*1.2, -torch.ones_like(gs_pos.min(0)[0])*1.5).detach().clone()
     max_v = torch.max(gs_pos.max(0)[0]*1.2, torch.ones_like(gs_pos.max(0)[0])*1.5).detach().clone()
     aabb = torch.cat([min_v, max_v], 0).view(2, 3)
