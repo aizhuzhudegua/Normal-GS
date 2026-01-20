@@ -103,6 +103,7 @@ def training(dataset, opt, pipe,sdf_opt, dataset_name, testing_iterations, savin
     iter_start = torch.cuda.Event(enable_timing = True)
     iter_end = torch.cuda.Event(enable_timing = True)
 
+    init_flag = True
     viewpoint_stack = None
     ema_loss_for_log = 0.0
     progress_bar = tqdm(range(first_iter, opt.iterations), desc="Training progress")
