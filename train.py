@@ -47,7 +47,6 @@ from utils.graphics_utils import normalize_rendered_by_weights, render_normal_fr
 from utils.image_utils import linear_to_srgb
 import torch.nn.functional as F
 from fields.shape_renders import SDF_RENDER_DICT
-from gaussian_renderer import render_fn_dict
 
 # torch.set_num_threads(32)
 lpips_fn = lpips.LPIPS(net='vgg').to('cuda')
