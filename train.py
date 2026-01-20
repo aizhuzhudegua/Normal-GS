@@ -307,7 +307,7 @@ def sdf_init(train_cams, sdf_opt, pipe, scene, render_fn, sdf_render, pretrained
     for i in tqdm(range(pretrained_iters)):
         viewpoint_cam = train_cams[randint(0, len(train_cams)-1)]
         gt_image = viewpoint_cam.original_image.cuda()
-        mask = viewpoint_cam.gt_alpha_mask.cuda()
+        mask = viewpoint_cam.mask
         mask[mask < 0.5] = 0
         mask[mask >= 0.5] = 1
         gt_image = gt_image * mask + background[:, None, None] * (1-mask)
