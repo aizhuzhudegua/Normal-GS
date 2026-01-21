@@ -33,7 +33,6 @@ class Scene:
         self.model_path = args.model_path
         self.loaded_iter = None
         self.gaussians = gaussians
-        self.env_mode = args.env_mode
        
         self.enable_indirect = False
         if load_iteration:
