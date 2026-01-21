@@ -139,7 +139,7 @@ def training(dataset, opt, pipe,sdf_opt, dataset_name, testing_iterations, savin
         voxel_visible_mask = prefilter_voxel(viewpoint_cam, gaussians, pipe,background)
         retain_grad = (iteration < opt.update_until and iteration >= 0)
         render_pkg = render(viewpoint_cam, gaussians, pipe, background, visible_mask=voxel_visible_mask, retain_grad=retain_grad,
-                            render_n=render_n, render_dotprod=reg_back_normal, render_full=render_full)
+                            render_n=True, render_dotprod=True, render_full=True)
         image, viewspace_point_tensor, visibility_filter, offset_selection_mask, radii, scaling, opacity = render_pkg["render"], render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["selection_mask"], render_pkg["radii"], render_pkg["scaling"], render_pkg["neural_opacity"]
 
         # image = linear_to_srgb(image)
