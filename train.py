@@ -122,7 +122,7 @@ def training(dataset, opt, pipe,sdf_opt, dataset_name, testing_iterations, savin
         if not viewpoint_stack:
             viewpoint_stack = scene.getTrainCameras().copy()
         viewpoint_cam = viewpoint_stack.pop(randint(0, len(viewpoint_stack)-1))
-        mask = viewpoint_cam.mask
+        mask = viewpoint_cam.gt_alpha_mask.cuda()
 
         # Render
         if (iteration - 1) == debug_from:
