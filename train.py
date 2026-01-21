@@ -213,11 +213,11 @@ def training(dataset, opt, pipe,sdf_opt, dataset_name, testing_iterations, savin
             acc = render_pkg['alpha'].permute(1, 2, 0)
 
             viewdirs, valid_mask = viewpoint_cam.get_filtered_ray()
-            valid_normal = normal.view(-1, 3)
-            valid_depth = depth.view(-1, 1)
-            valid_viewdirs = viewdirs.view(-1, 3)
-            valid_pos = pos.view(-1, 3)
-            valid_acc = acc.view(-1, 1)
+            valid_normal = normal.reshape(-1, 3)  # 统一替换为reshape更规范
+            valid_depth = depth.reshape(-1, 1)    # 核心修复：view → reshape
+            valid_viewdirs = viewdirs.reshape(-1, 3)
+            valid_pos = pos.reshape(-1, 3)
+            valid_acc = acc.reshape(-1, 1)
             bs = valid_viewdirs.shape[0]
             valid_gt = gt_image.permute(1, 2, 0).view(-1, 3)
             if sdf_opt.batchify and bs > sdf_opt.batch_size:
